@@ -1,0 +1,524 @@
+import discord
+from discord.ext import commands, tasks
+from discord import Embed, File, Color
+import os
+import aiohttp
+import sqlite3
+import logging
+from datetime import datetime
+from io import BytesIO
+from dotenv import load_dotenv
+import re
+from discord.ext import commands
+import json
+from typing import List, Dict
+from music import Music 
+import asyncio
+
+# Load env
+load_dotenv("env.txt")
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise Exception("❌ Missing DISCORD_TOKEN in env.txt")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
+# Intents dan bot
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Database Premium
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect('premium.db')
+        self._setup()
+
+    def _setup(self):
+        with self.conn:
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    is_premium BOOLEAN DEFAULT FALSE,
+                    expiry_date TEXT
+                )
+            ''')
+
+    def get_status(self, user_id):
+        row = self.conn.execute('SELECT is_premium FROM users WHERE user_id=?', (user_id,)).fetchone()
+        return row[0] if row else False
+
+    def set_premium(self, user_id, expiry):
+        with self.conn:
+            self.conn.execute('REPLACE INTO users VALUES (?, ?, ?)', (user_id, True, expiry))
+
+db = Database()
+
+# AI Chat (OpenRouter GPT)
+@bot.command()
+async def ai(ctx, *, message: str):
+    if ctx.channel.id != 1397904275467796480:
+        return await ctx.send("❌ Use this in the AI channel!")
+    
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "openai/gpt-3.5-turbo",
+        "messages": [{"role": "system", "content": "You are Yxu, a helpful AI assistant"},
+                     {"role": "user", "content": message}]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as resp:
+                data = await resp.json()
+                await ctx.send(data['choices'][0]['message']['content'])
+    except Exception as e:
+        await ctx.send(f"⚠️ Error: {e}")
+
+# TikTok Downloader
+@bot.command(aliases=['tt'])
+async def tiktok(ctx, url: str):
+    async with ctx.typing():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://tikwm.com/api/?url={url}") as resp:
+                    data = await resp.json()
+                    if not data.get('data'):
+                        return await ctx.send("❌ Invalid TikTok URL")
+                    video_url = data['data']['play']
+                    async with session.get(video_url) as video_res:
+                        await ctx.send(file=File(BytesIO(await video_res.read()), filename="tiktok.mp4"))
+        except Exception as e:
+            await ctx.send(f"⚠️ Error: {e}")
+
+# Instagram Downloader
+@bot.command(aliases=['ig'])
+async def instagram(ctx, url: str):
+    async with ctx.typing():
+        if not re.match(r'https?://(www\.)?instagram\.com/(p|reel)/', url):
+            return await ctx.send("❌ Invalid Instagram URL")
+        try:
+            async with aiohttp.ClientSession(headers={
+                "X-RapidAPI-Key": os.getenv("RAPIDAPI_KEY"),
+                "X-RapidAPI-Host": "instagram-downloader-download-instagram-videos-stories.p.rapidapi.com"
+            }) as session:
+                async with session.get("https://instagram-downloader-download-instagram-videos-stories.p.rapidapi.com/index", params={"url": url}) as resp:
+                    data = await resp.json()
+                    if not data.get('media'):
+                        return await ctx.send("❌ Failed to download")
+                    async with session.get(data['media']) as media_res:
+                        ext = 'mp4' if 'video' in data.get('type', '') else 'jpg'
+                        await ctx.send(file=File(BytesIO(await media_res.read()), filename=f"instagram.{ext}"))
+        except Exception as e:
+            await ctx.send(f"⚠️ Error: {e}")
+
+# Stock Tracker Class
+class StockTracker:
+    def __init__(self):
+        self.last_data = {}
+
+    async def fetch(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.joshlei.com/v2/growagarden/stock") as r:
+                if r.status == 200:
+                    return await r.json()
+                return None
+
+    def generate_embed(self, data):
+        embed = Embed(title="🌱 Grow A Garden Stock", description=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), color=Color.green())
+        if 'travelingmerchant_stock' in data:
+            merchant = data['travelingmerchant_stock']
+            items = "\n".join(f"• {item['display_name']} x{item['quantity']}" for item in merchant.get('stock', []))
+            embed.add_field(name=f"🧳 {merchant.get('merchantName', 'Traveling Merchant')}", value=items or "Kosong", inline=False)
+        for key, value in data.items():
+            if key.endswith('_stock') and isinstance(value, list):
+                title = key.replace('_stock', '').replace('_', ' ').title()
+                item_text = "\n".join(f"• {item['display_name']} x{item['quantity']}" for item in value)
+                embed.add_field(name=f"📦 {title}", value=item_text or "Empty", inline=True)
+        return embed
+
+    def detect_changes(self, new_data):
+        changes = []
+        for key, items in new_data.items():
+            if key not in self.last_data:
+                changes.append(f"➕ New: {key}")
+                continue
+            if key == 'travelingmerchant_stock':
+                old = {i['id']: i for i in self.last_data[key].get('stock', [])}
+                for item in items.get('stock', []):
+                    if item['id'] not in old:
+                        changes.append(f"🆕 {item['display_name']}")
+                    elif old[item['id']]['quantity'] != item['quantity']:
+                        changes.append(f"🔁 {item['display_name']} {old[item['id']]['quantity']} → {item['quantity']}")
+            elif isinstance(items, list):
+                old = {i['id']: i for i in self.last_data.get(key, [])}
+                for item in items:
+                    if item['id'] not in old:
+                        changes.append(f"➕ {item['display_name']}")
+        self.last_data = new_data
+        return changes
+
+stock = StockTracker()
+
+@tasks.loop(minutes=5)
+async def update_stock_loop():
+    channel = bot.get_channel(1390918605066997842)  # Ganti channel ID sesuai kebutuhan
+    if not channel:
+        return
+    try:
+        data = await stock.fetch()
+        if not data:
+            return
+        
+        # Detect changes before generating embed
+        changes = stock.detect_changes(data)
+        embed = stock.generate_embed(data)
+        
+        if changes:
+            embed.add_field(name="🔄 Perubahan", value="\n".join(changes[:10]), inline=False)
+            embed.color = Color.orange()
+        await channel.send(embed=embed)
+    except Exception as e:
+        await channel.send(f"⚠️ Stock update error: {e}")
+
+@bot.command()
+async def stockcheck(ctx):
+    """Manual check stock"""
+    async with ctx.typing():
+        data = await stock.fetch()
+        if data:
+            embed = stock.generate_embed(data)
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("❌ Failed to fetch stock")
+
+@bot.event
+async def on_ready():
+    logging.info(f"{bot.user} online!")
+    await bot.change_presence(activity=discord.Game(name="!stockcheck"))
+    update_stock_loop.start()
+
+# Load language databases
+def load_language_filters():
+    try:
+        with open('language_filters.json', 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "indonesian": ["bangsat", "anjing", "kontol", "asu", "memek"],
+            "english": ["fuck", "shit", "bitch", "asshole", "cunt"],
+            "racist": ["nigga", "nigger", "chink", "spic", "kafir"]
+        }
+
+class LanguageDetector(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.filters = load_language_filters()
+        self.whitelist = []  # Channel IDs to exempt
+        self.warning_threshold = 3  # Warnings before mute
+        self.user_warnings = {}  # {user_id: warning_count}
+        
+        # Compile regex patterns for each category
+        self.patterns = {
+            lang: re.compile(rf'\b({"|".join(map(re.escape, words))}\b', re.IGNORECASE)
+            for lang, words in self.filters.items()
+        }
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot or not message.guild:
+            return
+            
+        if message.channel.id in self.whitelist:
+            return
+
+        violations = self.detect_bad_language(message.content)
+        if violations:
+            await self.handle_violation(message, violations)
+
+    def detect_bad_language(self, text: str) -> Dict[str, List[str]]:
+        """Detect offensive language in text"""
+        violations = {}
+        for lang, pattern in self.patterns.items():
+            matches = pattern.findall(text)
+            if matches:
+                violations[lang] = list(set(matches))  # Remove duplicates
+        return violations
+
+    async def handle_violation(self, message, violations):
+        # Delete the offending message
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+
+        # Prepare warning message
+        user = message.author
+        warning_msg = [
+            f"⚠️ {user.mention} Please mind your language!",
+            "**Violations detected:**"
+        ]
+        
+        for lang, words in violations.items():
+            warning_msg.append(f"- {lang.capitalize()}: {', '.join(words)}")
+
+        # Send warning
+        warning = await message.channel.send("\n".join(warning_msg), delete_after=10)
+
+        # Track warnings
+        self.user_warnings[user.id] = self.user_warnings.get(user.id, 0) + 1
+        
+        # Apply mute if threshold reached
+        if self.user_warnings[user.id] >= self.warning_threshold:
+            await self.mute_user(user, message.guild)
+
+    async def mute_user(self, user, guild):
+        """Mute the user temporarily"""
+        mute_role = discord.utils.get(guild.roles, name="Muted")
+        if not mute_role:
+            mute_role = await self.create_mute_role(guild)
+        
+        try:
+            await user.add_roles(mute_role)
+            await user.send(f"🔇 You've been muted in {guild.name} for repeated language violations")
+            
+            # Schedule unmute
+            await asyncio.sleep(self.mute_duration)
+            await user.remove_roles(mute_role)
+            
+        except discord.Forbidden:
+            pass
+
+    async def create_mute_role(self, guild):
+        """Create mute role if it doesn't exist"""
+        mute_role = await guild.create_role(name="Muted", color=discord.Color.dark_red())
+        
+        # Configure permissions
+        for channel in guild.text_channels:
+            await channel.set_permissions(mute_role,
+                send_messages=False,
+                add_reactions=False
+            )
+            
+        return mute_role
+
+    # Admin commands to manage filters
+    @commands.group()
+    @commands.has_permissions(manage_guild=True)
+    async def filter(self, ctx):
+        """Language filter management"""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @filter.command()
+    async def add(self, ctx, language: str, *, words: str):
+        """Add words to filter"""
+        language = language.lower()
+        if language not in self.filters:
+            return await ctx.send(f"Invalid language. Available: {', '.join(self.filters.keys())}")
+        
+        new_words = [w.strip() for w in words.split(",")]
+        self.filters[language].extend(new_words)
+        self._update_patterns()
+        save_filters(self.filters)
+        await ctx.send(f"✅ Added {len(new_words)} words to {language} filter")
+
+    @filter.command()
+    async def list(self, ctx, language: str):
+        """List filtered words"""
+        language = language.lower()
+        if language not in self.filters:
+            return await ctx.send(f"Invalid language. Available: {', '.join(self.filters.keys())}")
+        
+        await ctx.send(f"🚫 {language.capitalize()} filter ({len(self.filters[language])} words):\n" +
+                      ", ".join(self.filters[language][:50]) + 
+                      ("..." if len(self.filters[language]) > 50 else ""))
+
+def save_filters(filters):
+    with open('language_filters.json', 'w') as f:
+        json.dump(filters, f)
+
+def setup(bot):
+    bot.add_cog(LanguageDetector(bot))
+    
+# Music Cog (kept as is)
+class Music(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.queue = []
+        self.current = None
+        self.autoplay = False
+        self.ctx = None  # Untuk menyimpan context terakhir
+
+    @commands.command()
+    async def join(self, ctx, *, channel: discord.VoiceChannel = None):
+        """Joins a voice channel"""
+        if channel is None:
+            if not ctx.author.voice:
+                await ctx.send("You are not connected to a voice channel.")
+                return
+            channel = ctx.author.voice.channel
+        
+        if ctx.voice_client is not None:
+            return await ctx.voice_client.move_to(channel)
+        
+        await channel.connect()
+
+    @commands.command()
+    async def play(self, ctx, *, url):
+        """Plays a song from YouTube"""
+        async with ctx.typing():
+            player = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True)
+            
+            if not ctx.voice_client.is_playing():
+                ctx.voice_client.play(player, after=lambda e: self.play_next(ctx))
+                self.current = player
+                await ctx.send(f'Now playing: {player.title}')
+            else:
+                self.queue.append(player)
+                await ctx.send(f'Added to queue: {player.title}')
+        
+        self.ctx = ctx  # Simpan context untuk callback after
+
+    def play_next(self, ctx=None):
+        if ctx is None:
+            ctx = self.ctx
+        
+        if self.queue:
+            next_song = self.queue.pop(0)
+            ctx.voice_client.play(next_song, after=lambda e: self.play_next(ctx))
+            self.current = next_song
+            asyncio.run_coroutine_threadsafe(ctx.send(f'Now playing: {next_song.title}'), self.bot.loop)
+        elif self.autoplay and self.current:
+            # Implementasi autoplay dengan mencari lagu terkait
+            asyncio.run_coroutine_threadsafe(self.auto_play_related(ctx), self.bot.loop)
+
+    @commands.command()
+    async def autoplay(self, ctx):
+        """Toggles autoplay"""
+        self.autoplay = not self.autoplay
+        await ctx.send(f'Autoplay is now {"on" if self.autoplay else "off"}')
+        
+        # Jika autoplay diaktifkan dan tidak ada yang diputar, mulai mainkan
+        if self.autoplay and not ctx.voice_client.is_playing() and not self.queue:
+            await ctx.invoke(self.bot.get_command('play'), query='lofi hip hop radio')
+
+    async def auto_play_related(self, ctx):
+        """Fungsi untuk memainkan lagu terkait secara otomatis"""
+        # Ini adalah implementasi sederhana, bisa diganti dengan API yang lebih canggih
+        related_query = f"{self.current.title} radio"
+        await ctx.send(f'Autoplay: Finding related songs to {self.current.title}...')
+        await ctx.invoke(self.bot.get_command('play'), url=related_query)
+
+    @commands.command()
+    async def queue(self, ctx):
+        """Shows the current queue"""
+        if not self.queue:
+            return await ctx.send("Queue is empty")
+        
+        queue_list = "\n".join([f"{i+1}. {song.title}" for i, song in enumerate(self.queue)])
+        await ctx.send(f"Current queue:\n{queue_list}")
+
+    @commands.command()
+    async def skip(self, ctx):
+        """Skips the current song"""
+        if ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+            await ctx.send("Skipped current song")
+        else:
+            await ctx.send("Not playing anything")
+
+    @commands.command()
+    async def stop(self, ctx):
+        """Stops and disconnects the bot from voice"""
+        self.queue = []
+        self.autoplay = False
+        await ctx.voice_client.disconnect()
+
+# Server Tracker Cog (kept as is)
+class ServerTracker(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.server_data = {}  # Untuk menyimpan data tracking
+
+    @commands.command(name='track')
+    @commands.has_permissions(manage_guild=True)
+    async def track_server(self, ctx, action: str = None):
+        """Menampilkan atau mengelola tracking server"""
+        if action is None or action.lower() == 'show':
+            await self.show_server_stats(ctx)
+        elif action.lower() == 'start':
+            await self.start_tracking(ctx)
+        elif action.lower() == 'stop':
+            await self.stop_tracking(ctx)
+        elif action.lower() == 'report':
+            await self.generate_report(ctx)
+        else:
+            await ctx.send("Perintah tidak valid. Gunakan: show, start, stop, atau report")
+
+    async def show_server_stats(self, ctx):
+        """Menampilkan statistik dasar server"""
+        guild = ctx.guild
+        
+        # Hitung berbagai statistik
+        total_members = len(guild.members)
+        online_members = sum(1 for m in guild.members if m.status != discord.Status.offline)
+        bot_count = sum(1 for m in guild.members if m.bot)
+        
+        channel_counts = {
+            'text': len(guild.text_channels),
+            'voice': len(guild.voice_channels),
+            'categories': len(guild.categories)
+        }
+        
+        # Buat embed
+        embed = discord.Embed(
+            title=f"📊 Statistik Server {guild.name}",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_thumbnail(url=guild.icon_url)
+        
+        embed.add_field(
+            name="👥 Anggota",
+            value=f"Total: {total_members}\nOnline: {online_members}\nBot: {bot_count}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📢 Channels",
+            value=f"Text: {channel_counts['text']}\nVoice: {channel_counts['voice']}\nCategories: {channel_counts['categories']}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🆔 Info Lain",
+            value=f"Pemilik: {guild.owner.mention}\nDibuat: {guild.created_at.strftime('%Y-%m-%d')}\nRegion: {str(guild.region).title()}",
+            inline=False
+        )
+        
+        # Tambahkan data tracking jika tersedia
+        if guild.id in self.server_data:
+            tracking_info = self.server_data[guild.id]
+            embed.add_field(
+                name="📈 Tracking",
+                value=f"Status: {'Aktif' if tracking_info['active'] else 'Nonaktif'}\nDimulai: {tracking_info['start_time'].strftime('%Y-%m-%d %H:%M')}",
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+
+    async def start_tracking(self, ctx):
+        """Memulai tracking aktivitas server"""
+        guild_id = ctx.guild.id
+        
+        if guild_id in self.server_data and self.server_data[guild_id]['active']:
+            await ctx.send("Tracking sudah aktif untuk server ini")
+            return
+Jalankan bot
+if __name__ == "__main__":
+    bot.run(TOKEN)
